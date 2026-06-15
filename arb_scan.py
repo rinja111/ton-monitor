@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TON cross-DEX arbitrage SCANNER (signals only)."""
+"""TON multi-DEX arbitrage SCANNER (signals only -- read-only, no wallet, no trades)."""
 import os
 import sys
 import requests
@@ -45,7 +45,12 @@ def get_symbol(addr):
         return "?"
 
 
-def scan_token(addr):
+def pretty(dex):
+    return dex.replace("_", " ").replace("v2", "").strip().title() or "DEX"
+
+
+def get_venues(addr):
+    """All DEX venues for one token (most liquid pool per DEX), after MIN_LIQ filter."""
     url = f"{GT}/networks/{NETWORK}/tokens/{addr}/pools"
     r = requests.get(url, headers=HEAD, timeout=30)
     r.raise_for_status()
@@ -72,24 +77,31 @@ def scan_token(addr):
                 venues[dex] = {"price": price, "liq": liq, "dex": dex}
         except Exception:
             continue
+    return sorted(venues.values(), key=lambda v: v["price"])
 
+
+def opp_from_venues(venues):
     if len(venues) < 2:
         return None
-
-    vs = list(venues.values())
-    cheap = min(vs, key=lambda v: v["price"])
-    dear = max(vs, key=lambda v: v["price"])
+    cheap, dear = venues[0], venues[-1]
     if cheap["price"] <= 0:
         return None
     gross = (dear["price"] - cheap["price"]) / cheap["price"] * 100.0
     if gross > MAX_SPREAD:
         return None
-    net = gross - COST
-    return {"gross": gross, "net": net, "buy": cheap, "sell": dear}
+    return {"gross": gross, "net": gross - COST, "buy": cheap, "sell": dear}
 
 
-def pretty(dex):
-    return dex.replace("_", " ").replace("v2", "").strip().title() or "DEX"
+def venue_block(venues, buy_dex=None, sell_dex=None):
+    out = []
+    for v in venues:
+        tag = ""
+        if v["dex"] == buy_dex:
+            tag = " 🟢 buy"
+        elif v["dex"] == sell_dex:
+            tag = " 🔴 sell"
+        out.append(f'  {pretty(v["dex"])}: ${v["price"]:.8f} (liq ${v["liq"]:,.0f}){tag}')
+    return "\n".join(out)
 
 
 def main():
@@ -97,43 +109,61 @@ def main():
         print("No tokens to scan.")
         sys.exit(0)
 
-    results = []
+    scanned = []  # (addr, venues)
     for addr in TOKENS:
         try:
-            res = scan_token(addr)
-            if res:
-                results.append((addr, res))
+            scanned.append((addr, get_venues(addr)))
         except Exception as e:
             print(f"scan failed for {addr}: {e}")
 
-    results.sort(key=lambda x: x[1]["net"], reverse=True)
-    hits = [r for r in results if r[1]["net"] >= THRESHOLD]
+    # opportunities above threshold
+    hits = []
+    for addr, venues in scanned:
+        opp = opp_from_venues(venues)
+        if opp and opp["net"] >= THRESHOLD:
+            hits.append((addr, venues, opp))
+    hits.sort(key=lambda x: x[2]["net"], reverse=True)
 
-    if not hits and EVENT != "workflow_dispatch":
-        print("No opportunities; silent.")
+    if hits:
+        lines = [f"📈 <b>Multi-DEX Arb scan</b> — net of ~{COST:.1f}% costs", ""]
+        for addr, venues, opp in hits:
+            sym = get_symbol(addr)
+            link = f"https://www.geckoterminal.com/{NETWORK}/tokens/{addr}"
+            lines.append(f'<b>+{opp["net"]:.2f}%</b> net — <b>{sym}</b> (gross {opp["gross"]:.2f}%)')
+            lines.append(venue_block(venues, opp["buy"]["dex"], opp["sell"]["dex"]))
+            lines.append(f'  🔗 <a href="{link}">open token</a>')
+            lines.append("")
+        lines.append("⚠️ Gross prices; real fill limited by liquidity & slippage. Not advice.")
+        tg("\n".join(lines))
+        print(f"Reported {len(hits)} hit(s).")
         return
 
-    if not hits:
-        tg(f"🔎 <b>Arb scan</b>\nNo spread above {THRESHOLD:.1f}% net right now "
-           f"(checked {len(TOKENS)} token(s), costs ~{COST:.1f}%).")
+    # no hits: stay silent on schedule, but show a multi-DEX snapshot on manual run
+    if EVENT != "workflow_dispatch":
+        print("No opportunities above threshold; silent.")
         return
 
-    lines = [f"📈 <b>Arb scan</b> — net of ~{COST:.1f}% costs", ""]
-    for addr, r in hits:
-        buy, sell = r["buy"], r["sell"]
-        sym = get_symbol(addr)
-        link = f"https://www.geckoterminal.com/{NETWORK}/tokens/{addr}"
-        lines.append(
-            f'<b>+{r["net"]:.2f}%</b> — <b>{sym}</b> (gross {r["gross"]:.2f}%)\n'
-            f'  buy {pretty(buy["dex"])} ${buy["price"]:.8f}\n'
-            f'  sell {pretty(sell["dex"])} ${sell["price"]:.8f}\n'
-            f'  liq ${buy["liq"]:,.0f} / ${sell["liq"]:,.0f}\n'
-            f'  🔗 <a href="{link}">open token</a>'
-        )
-    lines.append("")
-    lines.append("⚠️ Gross prices; real fill limited by liquidity & slippage. Not advice.")
+    multi = [(a, v) for a, v in scanned if len(v) >= 2]
+    multi.sort(key=lambda x: sum(z["liq"] for z in x[1]), reverse=True)
+
+    lines = [f"🔎 <b>Multi-DEX Arb scan</b>",
+             f"No spread above {THRESHOLD:.1f}% net (costs ~{COST:.1f}%).", ""]
+    if multi:
+        lines.append("Live multi-DEX view (top pairs):")
+        lines.append("")
+        for addr, venues in multi[:3]:
+            sym = get_symbol(addr)
+            opp = opp_from_venues(venues)
+            spr = f" — spread {opp['gross']:.2f}%" if opp else ""
+            lines.append(f"<b>{sym}</b>{spr}")
+            lines.append(venue_block(venues,
+                         opp["buy"]["dex"] if opp else None,
+                         opp["sell"]["dex"] if opp else None))
+            lines.append("")
+    else:
+        lines.append("No token had pools on 2+ DEXs above the liquidity floor.")
     tg("\n".join(lines))
-    print(f"Reported {len(hits)} hit(s).")
+    print("Snapshot sent.")
 
 
 if __name__ == "__main__":
