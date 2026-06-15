@@ -1,0 +1,32 @@
+name: TON Arb Scanner
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ton-arb
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run arb scan
+        env:
+          TG_TOKEN:      ${{ secrets.TG_TOKEN }}
+          TG_CHAT:       ${{ secrets.TG_CHAT }}
+          ARB_TOKENS:    ${{ vars.ARB_TOKENS }}
+          ARB_THRESHOLD: ${{ vars.ARB_THRESHOLD }}
+          ARB_COST:      ${{ vars.ARB_COST }}
+          ARB_MIN_LIQ:   ${{ vars.ARB_MIN_LIQ }}
+        run: python arb_scan.py
