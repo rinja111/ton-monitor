@@ -93,14 +93,24 @@ def format_trade(trade, symbol):
     a = trade["attributes"]
     kind = a.get("kind", "?")
     usd = float(a.get("volume_in_usd") or 0)
+    whale = "🐋 " if usd >= 100 else ""
     header = "🟢 BUY" if kind == "buy" else "🔴 SELL"
-    lines = [f"{header}  <b>{symbol}</b>", f"💵 ${usd:,.2f}"]
-    price_usd = a.get("price_to_in_usd") or a.get("price_from_in_usd")
+    lines = [f"{whale}{header}  <b>{symbol}</b>", f"💵 ${usd:,.2f}"]
+
+    amount = a.get("to_token_amount") if kind == "buy" else a.get("from_token_amount")
+    if amount:
+        try:
+            lines.append(f"🪙 {float(amount):,.0f} {symbol}")
+        except Exception:
+            pass
+
+    price_usd = a.get("price_to_in_usd")
     if price_usd:
         try:
             lines.append(f"🏷 ${float(price_usd):.8f}")
         except Exception:
             pass
+
     txh = a.get("tx_hash", "")
     if txh:
         lines.append(f'🔗 <a href="https://tonviewer.com/transaction/{txh}">view tx</a>')
