@@ -35,28 +35,30 @@ def addr_matches(rel_id, addr):
     return addr.lower() in (rel_id or "").lower()
 
 
-def get_symbol(addr):
-    try:
-        url = f"{GT}/networks/{NETWORK}/tokens/{addr}"
-        r = requests.get(url, headers=HEAD, timeout=30)
-        r.raise_for_status()
-        return r.json()["data"]["attributes"].get("symbol") or "?"
-    except Exception:
-        return "?"
-
-
 def pretty(dex):
     return dex.replace("_", " ").replace("v2", "").strip().title() or "DEX"
 
 
-def get_venues(addr):
-    """All DEX venues for one token (most liquid pool per DEX), after MIN_LIQ filter."""
+def symbol_from_name(name, is_base):
+    # pool name is like "SMONY / TON"; base is left, quote is right
+    try:
+        parts = [p.strip() for p in name.split("/")]
+        if len(parts) == 2:
+            return parts[0] if is_base else parts[1]
+    except Exception:
+        pass
+    return ""
+
+
+def get_token(addr):
+    """Return (symbol, venues) for one token. venues = list per DEX, sorted by price."""
     url = f"{GT}/networks/{NETWORK}/tokens/{addr}/pools"
     r = requests.get(url, headers=HEAD, timeout=30)
     r.raise_for_status()
     pools = r.json().get("data", [])
 
     venues = {}
+    symbol = ""
     for p in pools:
         try:
             at = p["attributes"]
@@ -65,10 +67,14 @@ def get_venues(addr):
             quote_id = rel.get("quote_token", {}).get("data", {}).get("id", "")
             if addr_matches(base_id, addr):
                 price = float(at.get("base_token_price_usd") or 0)
+                is_base = True
             elif addr_matches(quote_id, addr):
                 price = float(at.get("quote_token_price_usd") or 0)
+                is_base = False
             else:
                 continue
+            if not symbol:
+                symbol = symbol_from_name(at.get("name", ""), is_base)
             liq = float(at.get("reserve_in_usd") or 0)
             if price <= 0 or liq < MIN_LIQ:
                 continue
@@ -77,7 +83,9 @@ def get_venues(addr):
                 venues[dex] = {"price": price, "liq": liq, "dex": dex}
         except Exception:
             continue
-    return sorted(venues.values(), key=lambda v: v["price"])
+    if not symbol:
+        symbol = addr[:6] + "…" + addr[-4:]
+    return symbol, sorted(venues.values(), key=lambda v: v["price"])
 
 
 def opp_from_venues(venues):
@@ -109,25 +117,24 @@ def main():
         print("No tokens to scan.")
         sys.exit(0)
 
-    scanned = []  # (addr, venues)
+    scanned = []  # (addr, symbol, venues)
     for addr in TOKENS:
         try:
-            scanned.append((addr, get_venues(addr)))
+            sym, venues = get_token(addr)
+            scanned.append((addr, sym, venues))
         except Exception as e:
             print(f"scan failed for {addr}: {e}")
 
-    # opportunities above threshold
     hits = []
-    for addr, venues in scanned:
+    for addr, sym, venues in scanned:
         opp = opp_from_venues(venues)
         if opp and opp["net"] >= THRESHOLD:
-            hits.append((addr, venues, opp))
-    hits.sort(key=lambda x: x[2]["net"], reverse=True)
+            hits.append((addr, sym, venues, opp))
+    hits.sort(key=lambda x: x[3]["net"], reverse=True)
 
     if hits:
         lines = [f"📈 <b>Multi-DEX Arb scan</b> — net of ~{COST:.1f}% costs", ""]
-        for addr, venues, opp in hits:
-            sym = get_symbol(addr)
+        for addr, sym, venues, opp in hits:
             link = f"https://www.geckoterminal.com/{NETWORK}/tokens/{addr}"
             lines.append(f'<b>+{opp["net"]:.2f}%</b> net — <b>{sym}</b> (gross {opp["gross"]:.2f}%)')
             lines.append(venue_block(venues, opp["buy"]["dex"], opp["sell"]["dex"]))
@@ -138,21 +145,19 @@ def main():
         print(f"Reported {len(hits)} hit(s).")
         return
 
-    # no hits: stay silent on schedule, but show a multi-DEX snapshot on manual run
     if EVENT != "workflow_dispatch":
         print("No opportunities above threshold; silent.")
         return
 
-    multi = [(a, v) for a, v in scanned if len(v) >= 2]
-    multi.sort(key=lambda x: sum(z["liq"] for z in x[1]), reverse=True)
+    multi = [(a, s, v) for a, s, v in scanned if len(v) >= 2]
+    multi.sort(key=lambda x: sum(z["liq"] for z in x[2]), reverse=True)
 
     lines = [f"🔎 <b>Multi-DEX Arb scan</b>",
              f"No spread above {THRESHOLD:.1f}% net (costs ~{COST:.1f}%).", ""]
     if multi:
         lines.append("Live multi-DEX view (top pairs):")
         lines.append("")
-        for addr, venues in multi[:3]:
-            sym = get_symbol(addr)
+        for addr, sym, venues in multi[:3]:
             opp = opp_from_venues(venues)
             spr = f" — spread {opp['gross']:.2f}%" if opp else ""
             lines.append(f"<b>{sym}</b>{spr}")
