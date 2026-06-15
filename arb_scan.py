@@ -36,6 +36,16 @@ def addr_matches(rel_id, addr):
     return addr.lower() in (rel_id or "").lower()
 
 
+def get_symbol(addr):
+    try:
+        url = f"{GT}/networks/{NETWORK}/tokens/{addr}"
+        r = requests.get(url, headers=HEAD, timeout=30)
+        r.raise_for_status()
+        return r.json()["data"]["attributes"].get("symbol") or "?"
+    except Exception:
+        return "?"
+
+
 def scan_token(addr):
     url = f"{GT}/networks/{NETWORK}/tokens/{addr}/pools"
     r = requests.get(url, headers=HEAD, timeout=30)
@@ -112,99 +122,14 @@ def main():
     lines = [f"📈 <b>Arb scan</b> — net of ~{COST:.1f}% costs", ""]
     for addr, r in hits:
         buy, sell = r["buy"], r["sell"]
+        sym = get_symbol(addr)
+        link = f"https://www.geckoterminal.com/{NETWORK}/tokens/{addr}"
         lines.append(
-            f"<b>+{r['net']:.2f}%</b> net (gross {r['gross']:.2f}%)\n"
-            f"  buy {pretty(buy['dex'])} ${buy['price']:.8f}\n"
-            f"  sell {pretty(sell['dex'])} ${sell['price']:.8f}\n"
-            f"  liq ${buy['liq']:,.0f} / ${sell['liq']:,.0f}"
-        )
-    lines.append("")
-    lines.append("⚠️ Gross prices; real fill limited by liquidity & slippage. Not advice.")
-    tg("\n".join(lines))
-    print(f"Reported {len(hits)} opportunity(ies).")
-
-
-if __name__ == "__main__":
-    main()
-def scan_token(addr):
-    url = f"{GT}/networks/{NETWORK}/tokens/{addr}/pools"
-    r = requests.get(url, headers=HEAD, timeout=30)
-    r.raise_for_status()
-    pools = r.json().get("data", [])
-
-    venues = {}
-    for p in pools:
-        try:
-            at = p["attributes"]
-            rel = p.get("relationships", {})
-            base_id = rel.get("base_token", {}).get("data", {}).get("id", "")
-            quote_id = rel.get("quote_token", {}).get("data", {}).get("id", "")
-            if addr_matches(base_id, addr):
-                price = float(at.get("base_token_price_usd") or 0)
-            elif addr_matches(quote_id, addr):
-                price = float(at.get("quote_token_price_usd") or 0)
-            else:
-                continue
-            liq = float(at.get("reserve_in_usd") or 0)
-            if price <= 0 or liq < MIN_LIQ:
-                continue
-            dex = rel.get("dex", {}).get("data", {}).get("id", "dex?")
-            if dex not in venues or liq > venues[dex]["liq"]:
-                venues[dex] = {"price": price, "liq": liq, "dex": dex}
-        except Exception:
-            continue
-
-    if len(venues) < 2:
-        return None
-
-    vs = list(venues.values())
-    cheap = min(vs, key=lambda v: v["price"])
-    dear = max(vs, key=lambda v: v["price"])
-    if cheap["price"] <= 0:
-        return None
-    gross = (dear["price"] - cheap["price"]) / cheap["price"] * 100.0
-    net = gross - COST
-    return {"gross": gross, "net": net, "buy": cheap, "sell": dear}
-
-
-def pretty(dex):
-    return dex.replace("_", " ").replace("v2", "").strip().title() or "DEX"
-
-
-def main():
-    if not TOKENS:
-        print("No tokens to scan. Set ARB_TOKENS variable.")
-        sys.exit(0)
-
-    results = []
-    for addr in TOKENS:
-        try:
-            res = scan_token(addr)
-            if res:
-                results.append((addr, res))
-        except Exception as e:
-            print(f"scan failed for {addr}: {e}")
-
-    results.sort(key=lambda x: x[1]["net"], reverse=True)
-    hits = [r for r in results if r[1]["net"] >= THRESHOLD]
-
-    if not hits and EVENT != "workflow_dispatch":
-        print("No opportunities above threshold; staying silent.")
-        return
-
-    if not hits:
-        tg(f"🔎 <b>Arb scan</b>\nNo spread above {THRESHOLD:.1f}% net right now "
-           f"(checked {len(TOKENS)} token(s), costs assumed ~{COST:.1f}%).")
-        return
-
-    lines = [f"📈 <b>Arb scan</b> — net of ~{COST:.1f}% costs", ""]
-    for addr, r in hits:
-        buy, sell = r["buy"], r["sell"]
-        lines.append(
-            f"<b>+{r['net']:.2f}%</b> net (gross {r['gross']:.2f}%)\n"
-            f"  buy {pretty(buy['dex'])} ${buy['price']:.8f}\n"
-            f"  sell {pretty(sell['dex'])} ${sell['price']:.8f}\n"
-            f"  liq ${buy['liq']:,.0f} / ${sell['liq']:,.0f}"
+            f'<b>+{r["net"]:.2f}%</b> net — <b>{sym}</b> (gross {r["gross"]:.2f}%)\n'
+            f'  buy {pretty(buy["dex"])} ${buy["price"]:.8f}\n'
+            f'  sell {pretty(sell["dex"])} ${sell["price"]:.8f}\n'
+            f'  liq ${buy["liq"]:,.0f} / ${sell["liq"]:,.0f}\n'
+            f'  🔗 <a href="{link}">open token</a>'
         )
     lines.append("")
     lines.append("⚠️ Gross prices; real fill limited by liquidity & slippage. Not advice.")
