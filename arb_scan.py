@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""TON cross-DEX arbitrage SCANNER (signals only -- never trades, never touches a wallet)."""
+"""TON cross-DEX arbitrage SCANNER (signals only)."""
 import os
 import sys
-import json
 import requests
 
 TG_TOKEN  = os.environ["TG_TOKEN"]
@@ -95,7 +94,7 @@ def pretty(dex):
 
 def main():
     if not TOKENS:
-        print("No tokens to scan. Set ARB_TOKENS variable.")
+        print("No tokens to scan.")
         sys.exit(0)
 
     results = []
@@ -111,12 +110,12 @@ def main():
     hits = [r for r in results if r[1]["net"] >= THRESHOLD]
 
     if not hits and EVENT != "workflow_dispatch":
-        print("No opportunities above threshold; staying silent.")
+        print("No opportunities; silent.")
         return
 
     if not hits:
         tg(f"🔎 <b>Arb scan</b>\nNo spread above {THRESHOLD:.1f}% net right now "
-           f"(checked {len(TOKENS)} token(s), costs assumed ~{COST:.1f}%).")
+           f"(checked {len(TOKENS)} token(s), costs ~{COST:.1f}%).")
         return
 
     lines = [f"📈 <b>Arb scan</b> — net of ~{COST:.1f}% costs", ""]
@@ -125,7 +124,7 @@ def main():
         sym = get_symbol(addr)
         link = f"https://www.geckoterminal.com/{NETWORK}/tokens/{addr}"
         lines.append(
-            f'<b>+{r["net"]:.2f}%</b> net — <b>{sym}</b> (gross {r["gross"]:.2f}%)\n'
+            f'<b>+{r["net"]:.2f}%</b> — <b>{sym}</b> (gross {r["gross"]:.2f}%)\n'
             f'  buy {pretty(buy["dex"])} ${buy["price"]:.8f}\n'
             f'  sell {pretty(sell["dex"])} ${sell["price"]:.8f}\n'
             f'  liq ${buy["liq"]:,.0f} / ${sell["liq"]:,.0f}\n'
@@ -134,7 +133,7 @@ def main():
     lines.append("")
     lines.append("⚠️ Gross prices; real fill limited by liquidity & slippage. Not advice.")
     tg("\n".join(lines))
-    print(f"Reported {len(hits)} opportunity(ies).")
+    print(f"Reported {len(hits)} hit(s).")
 
 
 if __name__ == "__main__":
