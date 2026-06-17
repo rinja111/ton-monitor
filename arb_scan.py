@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TON arbitrage scanner via DexScreener API."""
+"""TON arbitrage scanner via DexScreener (auto-discovery)."""
 import os
 import sys
 import requests
@@ -7,18 +7,12 @@ import time
 
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT = os.environ.get("TG_CHAT")
+DISCOVER_LIMIT = int(os.environ.get("DISCOVER_LIMIT") or 20)
 THRESHOLD = float(os.environ.get("ARB_THRESHOLD") or 1.0)
 COST = float(os.environ.get("ARB_COST") or 1.2)
 MIN_LIQ = float(os.environ.get("ARB_MIN_LIQ") or 10000)
 
 DS = "https://api.dexscreener.com/latest/dex"
-
-# Токены для сканирования (можно добавить свои)
-TOKENS = [
-    "EQCxE6mUtQJKFnGfaROHKOa1P2yP1V-21cj6sRrVZt4GxhPw",  # NOT
-    "EQDxyvPeJDo79P0BL-qmfCBtH2E6xyi4y_Cm8Y_oxjU6HbyP",  # DOGS
-    "EQCM3bndy-6VJZs8HYRCLm5BMsEMR8Fb9X9aXvWYRThA1d5p",  # CATI
-]
 
 
 def tg(text):
@@ -39,6 +33,47 @@ def tg(text):
         print("Telegram send failed:", e)
 
 
+def discover_tokens():
+    """Найти активные токены на TON через DexScreener."""
+    found = set()
+    print("🔍 Discovering tokens from DexScreener...")
+    try:
+        # DexScreener не имеет прямого эндпоинта для сети,
+        # но мы можем использовать поиск по паре 'TON'
+        url = f"{DS}/search?q=TON"
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        pairs = data.get("pairs", [])
+
+        for p in pairs:
+            chain = p.get("chainId", "")
+            if chain.lower() != "ton":
+                continue
+            base = p.get("baseToken", {})
+            addr = base.get("address", "")
+            if addr:
+                found.add(addr)
+
+        # Если нашли мало, добавим ручной список известных токенов
+        if len(found) < 3:
+            known = [
+                "EQCxE6mUtQJKFnGfaROHKOa1P2yP1V-21cj6sRrVZt4GxhPw",
+                "EQDxyvPeJDo79P0BL-qmfCBtH2E6xyi4y_Cm8Y_oxjU6HbyP",
+                "EQCM3bndy-6VJZs8HYRCLm5BMsEMR8Fb9X9aXvWYRThA1d5p",
+                "EQD0i3aZzZwXrTIXgVSwgLybi5JTY8o7NwJ81QJtY8b7AjsC",
+                "EQB-MPwrd1G6W9Y-CS2paeNey8CIM1m_fbL4dbr3Orn-NS01",
+            ]
+            found.update(known)
+
+    except Exception as e:
+        print("❌ discover failed:", e)
+
+    result = list(found)[:DISCOVER_LIMIT]
+    print(f"✅ Discovered {len(result)} tokens")
+    return result
+
+
 def get_pools_dexscreener(addr):
     """Получить все пулы для токена через DexScreener."""
     url = f"{DS}/tokens/{addr}"
@@ -48,24 +83,33 @@ def get_pools_dexscreener(addr):
         data = r.json()
         return data.get("pairs", [])
     except Exception as e:
-        print(f"  ⚠️ DexScreener error for {addr[:8]}...: {e}")
         return []
 
 
 def main():
-    print("🚀 TON Arbitrage Scanner (DexScreener)")
-    print(f"   Checking {len(TOKENS)} tokens...")
+    print("🚀 TON Arbitrage Scanner (DexScreener auto-discovery)")
+    print(f"   Discover limit: {DISCOVER_LIMIT}")
+    print(f"   Min liquidity: ${MIN_LIQ:,.0f}")
 
+    tokens = discover_tokens()
+    if not tokens:
+        print("❌ No tokens found")
+        tg("❌ No tokens discovered. Check DexScreener API.")
+        return
+
+    print(f"\n📊 Scanning {len(tokens)} tokens...\n")
     results = []
-    for addr in TOKENS:
+
+    for i, addr in enumerate(tokens, 1):
+        print(f"🔎 [{i}/{len(tokens)}] {addr[:10]}...")
         pairs = get_pools_dexscreener(addr)
-        if not pairs:
-            print(f"   {addr[:8]}...: no pools found")
-            continue
 
         # Группируем по DEX
         dex_prices = {}
         for p in pairs:
+            chain = p.get("chainId", "")
+            if chain.lower() != "ton":
+                continue
             dex = p.get("dexId", "unknown")
             price = float(p.get("priceUsd", 0))
             liq = float(p.get("liquidity", {}).get("usd", 0))
@@ -75,14 +119,13 @@ def main():
                 dex_prices[dex] = {"price": price, "liq": liq, "dex": dex}
 
         if len(dex_prices) < 2:
-            print(f"   {addr[:8]}...: only {len(dex_prices)} DEX with sufficient liquidity")
+            print(f"   ⏭️  only {len(dex_prices)} DEX with sufficient liquidity")
             continue
 
-        # Найдём символ
         sym = pairs[0].get("baseToken", {}).get("symbol", addr[:8])
         venues = sorted(dex_prices.values(), key=lambda v: v["price"])
         results.append((addr, sym, venues))
-        print(f"   {sym}: {len(venues)} DEX venues")
+        print(f"   ✅ {sym}: {len(venues)} DEX venues")
 
     if not results:
         msg = "❌ No token with 2+ DEX pools found. Check MIN_LIQ or tokens."
@@ -90,10 +133,10 @@ def main():
         tg(msg)
         return
 
-    # Отправим список найденных токенов
+    # Отчёт в Telegram
     msg = f"🔍 Found {len(results)} tokens with 2+ DEX pools:\n\n"
     for addr, sym, venues in results[:5]:
-        msg += f"• {sym}: {len(venues)} DEXes\n"
+        msg += f"• <b>{sym}</b>: {len(venues)} DEXes\n"
         for v in venues:
             msg += f"    {v['dex']}: ${v['price']:.6f} (liq ${v['liq']:,.0f})\n"
         msg += "\n"
