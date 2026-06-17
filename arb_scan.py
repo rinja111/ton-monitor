@@ -3,7 +3,7 @@
 import os
 import sys
 import requests
-import time
+import html
 
 TG_TOKEN = os.environ.get("TG_TOKEN")
 TG_CHAT = os.environ.get("TG_CHAT")
@@ -38,13 +38,11 @@ def discover_tokens():
     found = set()
     print("🔍 Discovering tokens from DexScreener...")
     try:
-        # DexScreener не имеет прямого эндпоинта для сети,
-        # но мы можем использовать поиск по паре 'TON'
         url = f"{DS}/search?q=TON"
         r = requests.get(url, timeout=30)
         r.raise_for_status()
         data = r.json()
-        pairs = data.get("pairs", [])
+        pairs = data.get("pairs") or []  # Fix: handle null
 
         for p in pairs:
             chain = p.get("chainId", "")
@@ -55,7 +53,6 @@ def discover_tokens():
             if addr:
                 found.add(addr)
 
-        # Если нашли мало, добавим ручной список известных токенов
         if len(found) < 3:
             known = [
                 "EQCxE6mUtQJKFnGfaROHKOa1P2yP1V-21cj6sRrVZt4GxhPw",
@@ -81,7 +78,8 @@ def get_pools_dexscreener(addr):
         r = requests.get(url, timeout=30)
         r.raise_for_status()
         data = r.json()
-        return data.get("pairs", [])
+        pairs = data.get("pairs") or []  # Fix: handle null
+        return pairs
     except Exception as e:
         return []
 
@@ -90,6 +88,8 @@ def main():
     print("🚀 TON Arbitrage Scanner (DexScreener auto-discovery)")
     print(f"   Discover limit: {DISCOVER_LIMIT}")
     print(f"   Min liquidity: ${MIN_LIQ:,.0f}")
+    print(f"   Cost: {COST:.2f}%")
+    print(f"   Threshold: {THRESHOLD:.2f}%\n")
 
     tokens = discover_tokens()
     if not tokens:
@@ -97,8 +97,9 @@ def main():
         tg("❌ No tokens discovered. Check DexScreener API.")
         return
 
-    print(f"\n📊 Scanning {len(tokens)} tokens...\n")
-    results = []
+    print(f"📊 Scanning {len(tokens)} tokens...\n")
+    results = []       # (addr, sym, venues, spread, net)
+    errors = 0
 
     for i, addr in enumerate(tokens, 1):
         print(f"🔎 [{i}/{len(tokens)}] {addr[:10]}...")
@@ -111,8 +112,9 @@ def main():
             if chain.lower() != "ton":
                 continue
             dex = p.get("dexId", "unknown")
-            price = float(p.get("priceUsd", 0))
-            liq = float(p.get("liquidity", {}).get("usd", 0))
+            # Безопасное преобразование
+            price = float(p.get("priceUsd") or 0)
+            liq = float((p.get("liquidity") or {}).get("usd") or 0)
             if price <= 0 or liq < MIN_LIQ:
                 continue
             if dex not in dex_prices or liq > dex_prices[dex]["liq"]:
@@ -122,10 +124,20 @@ def main():
             print(f"   ⏭️  only {len(dex_prices)} DEX with sufficient liquidity")
             continue
 
-        sym = pairs[0].get("baseToken", {}).get("symbol", addr[:8])
+        # Получаем символ
+        sym = addr[:8]
+        for p in pairs:
+            s = p.get("baseToken", {}).get("symbol", "")
+            if s:
+                sym = s
+                break
+
         venues = sorted(dex_prices.values(), key=lambda v: v["price"])
-        results.append((addr, sym, venues))
-        print(f"   ✅ {sym}: {len(venues)} DEX venues")
+        lo, hi = venues[0], venues[-1]
+        spread = (hi["price"] - lo["price"]) / lo["price"] * 100.0
+        net = spread - COST
+        results.append((addr, sym, venues, spread, net))
+        print(f"   ✅ {sym}: {len(venues)} DEX, spread {spread:.2f}%, net {net:.2f}%")
 
     if not results:
         msg = "❌ No token with 2+ DEX pools found. Check MIN_LIQ or tokens."
@@ -133,14 +145,40 @@ def main():
         tg(msg)
         return
 
-    # Отчёт в Telegram
-    msg = f"🔍 Found {len(results)} tokens with 2+ DEX pools:\n\n"
-    for addr, sym, venues in results[:5]:
-        msg += f"• <b>{sym}</b>: {len(venues)} DEXes\n"
+    # Формируем отчёт
+    # Сначала сигналы (net >= THRESHOLD)
+    hits = [r for r in results if r[4] >= THRESHOLD]
+    hits.sort(key=lambda x: x[4], reverse=True)
+
+    msg_parts = []
+    if hits:
+        msg_parts.append(f"📈 <b>Arbitrage opportunities ({len(hits)})</b>\n")
+        for addr, sym, venues, spread, net in hits:
+            sym_safe = html.escape(sym)
+            link = f"https://www.dexscreener.com/ton/{addr}"
+            msg_parts.append(f"<b>{sym_safe}</b> — net <b>+{net:.2f}%</b> (gross {spread:.2f}%)")
+            for v in venues:
+                dex = html.escape(v["dex"])
+                msg_parts.append(f"  {dex}: ${v['price']:.6f} (liq ${v['liq']:,.0f})")
+            msg_parts.append(f"  🔗 <a href='{link}'>open on DexScreener</a>")
+            msg_parts.append("")
+    else:
+        msg_parts.append(f"🔎 <b>No opportunities above {THRESHOLD:.1f}% net</b>\n")
+
+    # Снэпшот топ‑3 токенов (для мониторинга)
+    top = sorted(results, key=lambda x: x[3], reverse=True)[:3]
+    msg_parts.append("📊 <b>Top spreads (monitoring)</b>\n")
+    for addr, sym, venues, spread, net in top:
+        sym_safe = html.escape(sym)
+        msg_parts.append(f"• {sym_safe}: gross {spread:.2f}%, net {net:.2f}%")
         for v in venues:
-            msg += f"    {v['dex']}: ${v['price']:.6f} (liq ${v['liq']:,.0f})\n"
-        msg += "\n"
-    tg(msg.strip())
+            dex = html.escape(v["dex"])
+            msg_parts.append(f"    {dex}: ${v['price']:.6f}")
+        msg_parts.append("")
+
+    msg_parts.append("⚠️ Gross prices; real fill limited by liquidity & slippage. Not advice.")
+    full_msg = "\n".join(msg_parts)
+    tg(full_msg)
     print("✅ Report sent to Telegram.")
 
 
