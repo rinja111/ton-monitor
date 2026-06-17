@@ -7,7 +7,8 @@ import requests
 TG_TOKEN  = os.environ["TG_TOKEN"]
 TG_CHAT   = os.environ["TG_CHAT"]
 NETWORK   = os.environ.get("NETWORK", "ton")
-TOKENS    = [t.strip() for t in os.environ.get("ARB_TOKENS", os.environ.get("TOKEN_ADDR", "")).split(",") if t.strip()]
+TOKENS    = []  # теперь заполняется автоматически
+DISCOVER_LIMIT = int(os.environ.get("DISCOVER_LIMIT") or 100)
 THRESHOLD = float(os.environ.get("ARB_THRESHOLD") or 1.0)
 COST      = float(os.environ.get("ARB_COST") or 1.2)
 MIN_LIQ   = float(os.environ.get("ARB_MIN_LIQ") or 10000)
@@ -48,6 +49,41 @@ def symbol_from_name(name, is_base):
     except Exception:
         pass
     return ""
+
+
+def discover_tokens():
+    """
+    Auto-discover top TON tokens from GeckoTerminal.
+    Returns token addresses.
+    """
+    found = set()
+
+    try:
+        url = f"{GT}/networks/{NETWORK}/trending_pools"
+        r = requests.get(url, headers=HEAD, timeout=30)
+        r.raise_for_status()
+
+        pools = r.json().get("data", [])
+
+        for p in pools:
+            try:
+                rel = p.get("relationships", {})
+                base = rel.get("base_token", {}).get("data", {}).get("id", "")
+                quote = rel.get("quote_token", {}).get("data", {}).get("id", "")
+
+                if "/tokens/" in base:
+                    found.add(base.split("/tokens/")[-1])
+
+                if "/tokens/" in quote:
+                    found.add(quote.split("/tokens/")[-1])
+
+            except Exception:
+                continue
+
+    except Exception as e:
+        print("discover failed:", e)
+
+    return list(found)[:DISCOVER_LIMIT]
 
 
 def get_token(addr):
@@ -113,12 +149,19 @@ def venue_block(venues, buy_dex=None, sell_dex=None):
 
 
 def main():
-    if not TOKENS:
-        print("No tokens to scan.")
+    tokens = TOKENS
+
+    if not tokens:
+        tokens = discover_tokens()
+
+    if not tokens:
+        print("No tokens discovered.")
         sys.exit(0)
 
+    print(f"Scanning {len(tokens)} discovered tokens...")
+
     scanned = []  # (addr, symbol, venues)
-    for addr in TOKENS:
+    for addr in tokens:
         try:
             sym, venues = get_token(addr)
             scanned.append((addr, sym, venues))
