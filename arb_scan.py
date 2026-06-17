@@ -4,10 +4,10 @@ import os
 import sys
 import requests
 
-TG_TOKEN  = os.environ["TG_TOKEN"]
-TG_CHAT   = os.environ["TG_CHAT"]
+TG_TOKEN  = os.environ.get("TG_TOKEN")
+TG_CHAT   = os.environ.get("TG_CHAT")
 NETWORK   = os.environ.get("NETWORK", "ton")
-TOKENS    = []  # теперь заполняется автоматически
+TOKEN_ADDR = os.environ.get("TOKEN_ADDR", "")  # fallback: comma-separated list
 DISCOVER_LIMIT = int(os.environ.get("DISCOVER_LIMIT") or 100)
 THRESHOLD = float(os.environ.get("ARB_THRESHOLD") or 1.0)
 COST      = float(os.environ.get("ARB_COST") or 1.2)
@@ -20,6 +20,9 @@ EVENT = os.environ.get("GITHUB_EVENT_NAME", "")
 
 
 def tg(text):
+    if not TG_TOKEN or not TG_CHAT:
+        print("❌ TG_TOKEN or TG_CHAT not set")
+        return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json={
@@ -41,7 +44,6 @@ def pretty(dex):
 
 
 def symbol_from_name(name, is_base):
-    # pool name is like "SMONY / TON"; base is left, quote is right
     try:
         parts = [p.strip() for p in name.split("/")]
         if len(parts) == 2:
@@ -57,13 +59,14 @@ def discover_tokens():
     Returns token addresses.
     """
     found = set()
-
+    print("🔍 Discovering tokens from GeckoTerminal...")
     try:
         url = f"{GT}/networks/{NETWORK}/trending_pools"
-        r = requests.get(url, headers=HEAD, timeout=30)
-        r.raise_for_status()
-
-        pools = r.json().get("data", [])
+        resp = requests.get(url, headers=HEAD, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        pools = data.get("data", [])
+        print(f"   Got {len(pools)} trending pools")
 
         for p in pools:
             try:
@@ -73,25 +76,33 @@ def discover_tokens():
 
                 if "/tokens/" in base:
                     found.add(base.split("/tokens/")[-1])
-
                 if "/tokens/" in quote:
                     found.add(quote.split("/tokens/")[-1])
-
             except Exception:
                 continue
 
     except Exception as e:
-        print("discover failed:", e)
+        print("❌ discover failed:", e)
 
-    return list(found)[:DISCOVER_LIMIT]
+    result = list(found)[:DISCOVER_LIMIT]
+    print(f"✅ Discovered {len(result)} unique tokens")
+    return result
 
 
 def get_token(addr):
     """Return (symbol, venues) for one token. venues = list per DEX, sorted by price."""
     url = f"{GT}/networks/{NETWORK}/tokens/{addr}/pools"
-    r = requests.get(url, headers=HEAD, timeout=30)
-    r.raise_for_status()
-    pools = r.json().get("data", [])
+    try:
+        resp = requests.get(url, headers=HEAD, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"   ⚠️ Failed to fetch pools for {addr}: {e}")
+        return None, []
+
+    pools = resp.json().get("data", [])
+    if not pools:
+        print(f"   ⚠️ No pools for {addr}")
+        return None, []
 
     venues = {}
     symbol = ""
@@ -121,7 +132,9 @@ def get_token(addr):
             continue
     if not symbol:
         symbol = addr[:6] + "…" + addr[-4:]
-    return symbol, sorted(venues.values(), key=lambda v: v["price"])
+    sorted_venues = sorted(venues.values(), key=lambda v: v["price"])
+    print(f"   {symbol}: found {len(sorted_venues)} DEX venues (liq ≥ ${MIN_LIQ:,.0f})")
+    return symbol, sorted_venues
 
 
 def opp_from_venues(venues):
@@ -149,24 +162,44 @@ def venue_block(venues, buy_dex=None, sell_dex=None):
 
 
 def main():
-    tokens = TOKENS
+    print("🚀 TON Multi-DEX Arbitrage Scanner")
+    print(f"   Network: {NETWORK}")
+    print(f"   Discover limit: {DISCOVER_LIMIT}")
+    print(f"   Min liquidity: ${MIN_LIQ:,.0f}")
+    print(f"   Threshold: {THRESHOLD:.2f}% net")
+    print(f"   Cost estimate: {COST:.2f}%")
+    print(f"   Max spread: {MAX_SPREAD:.2f}%")
+
+    # Try to get tokens from environment variable first (backward compatibility)
+    tokens = []
+    if TOKEN_ADDR:
+        tokens = [t.strip() for t in TOKEN_ADDR.split(",") if t.strip()]
+        print(f"📋 Using manual token list from TOKEN_ADDR ({len(tokens)} tokens)")
 
     if not tokens:
         tokens = discover_tokens()
 
     if not tokens:
-        print("No tokens discovered.")
-        sys.exit(0)
+        print("❌ No tokens discovered. Exiting.")
+        return
 
-    print(f"Scanning {len(tokens)} discovered tokens...")
+    print(f"📊 Scanning {len(tokens)} tokens...\n")
 
     scanned = []  # (addr, symbol, venues)
-    for addr in tokens:
-        try:
-            sym, venues = get_token(addr)
+    for i, addr in enumerate(tokens, 1):
+        print(f"🔎 [{i}/{len(tokens)}] {addr[:10]}...")
+        sym, venues = get_token(addr)
+        if sym and venues:
             scanned.append((addr, sym, venues))
-        except Exception as e:
-            print(f"scan failed for {addr}: {e}")
+        else:
+            print("   ⏭️  No usable pools, skipping.")
+
+    if not scanned:
+        print("❌ No tokens with at least 2 DEX pools above liquidity floor.")
+        tg("No tokens with 2+ DEX pools found. Check liquidity thresholds.")
+        return
+
+    print(f"\n✅ Scanned {len(scanned)} tokens with 2+ DEX venues.")
 
     hits = []
     for addr, sym, venues in scanned:
@@ -176,6 +209,7 @@ def main():
     hits.sort(key=lambda x: x[3]["net"], reverse=True)
 
     if hits:
+        print(f"🎯 Found {len(hits)} arbitrage opportunity(ies)!")
         lines = [f"📈 <b>Multi-DEX Arb scan</b> — net of ~{COST:.1f}% costs", ""]
         for addr, sym, venues, opp in hits:
             link = f"https://www.geckoterminal.com/{NETWORK}/tokens/{addr}"
@@ -185,13 +219,15 @@ def main():
             lines.append("")
         lines.append("⚠️ Gross prices; real fill limited by liquidity & slippage. Not advice.")
         tg("\n".join(lines))
-        print(f"Reported {len(hits)} hit(s).")
+        print("✅ Signals sent to Telegram.")
         return
 
+    print("ℹ️  No opportunities above threshold.")
     if EVENT != "workflow_dispatch":
-        print("No opportunities above threshold; silent.")
+        print("   Scheduled run — silent exit.")
         return
 
+    # Manual run: send snapshot
     multi = [(a, s, v) for a, s, v in scanned if len(v) >= 2]
     multi.sort(key=lambda x: sum(z["liq"] for z in x[2]), reverse=True)
 
@@ -211,7 +247,7 @@ def main():
     else:
         lines.append("No token had pools on 2+ DEXs above the liquidity floor.")
     tg("\n".join(lines))
-    print("Snapshot sent.")
+    print("📤 Snapshot sent to Telegram.")
 
 
 if __name__ == "__main__":
